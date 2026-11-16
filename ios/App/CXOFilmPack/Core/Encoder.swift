@@ -47,14 +47,15 @@ enum Encoder {
         }
     }
 
-    /// Single photo inside a film-strip frame (135 with sprocket holes, or a 120 rebate). The strip keeps the
-    /// photo's own proportions; portrait photos get a vertical strip.
+    /// Single photo inside a film-strip frame (135 with sprocket holes, or a 120 rebate). Like real film, the strip
+    /// runs horizontally (sprockets top and bottom) and a portrait photo is turned 90 degrees clockwise into it;
+    /// only an explicit "竖排" keeps the strip vertical.
     static func framed(_ src: PixelBuffer, is120: Bool, category: String, title: String, params: String = "", frame: Int,
                        orientation: StripOrientation = .auto) -> PixelBuffer {
         guard let image = src.cgImage() else { return src }
         let w = Double(src.width), h = Double(src.height)
         let portrait = w < h
-        let landscape = orientation == .horizontal || (orientation == .auto && !portrait)   // strip runs horizontally
+        let landscape = orientation != .vertical   // strip runs horizontally; portrait photos are rotated into it
         let spec = FilmStripArt.Spec(is120: is120, slotW: max(w, h), slotH: min(w, h))
         let pad = (spec.slotW * 0.08).rounded()
         let lw = spec.stripWidth(frames: 1) + 2 * pad, lh = spec.stripH + 2 * pad
@@ -71,8 +72,8 @@ enum Encoder {
 
     /// Lays the frames out as film strips (`columns` per strip) on paper, like a contact sheet. Portrait photos
     /// are turned sideways into the landscape window, as on a real contact sheet.
-    static func contactSheet(_ frames: [(buffer: PixelBuffer, name: String, category: String, params: String)], is135: Bool,
-                             columns: Int, cellEdge: Double) -> PixelBuffer? {
+    static func contactSheet(_ frames: [(buffer: PixelBuffer, name: String, category: String, params: String, vertical: Bool, crop: SheetCrop)], is135: Bool,
+                             columns: Int, cellEdge: Double, vertical: Bool = false) -> PixelBuffer? {
         guard !frames.isEmpty else { return nil }
         let cols = max(1, min(columns, frames.count))
         let rows = (frames.count + cols - 1) / cols
@@ -80,16 +81,21 @@ enum Encoder {
         let margin = (cellEdge * 0.12).rounded(), rowGap = (cellEdge * 0.12).rounded()
         let sheetW = spec.stripWidth(frames: cols) + 2 * margin
         let sheetH = Double(rows) * spec.stripH + Double(rows - 1) * rowGap + 2 * margin
-        let fw = Int(sheetW.rounded()), fh = Int(sheetH.rounded())
+        let sw = Int(sheetW.rounded()), sh = Int(sheetH.rounded())
+        let fw = vertical ? sh : sw, fh = vertical ? sw : sh        // vertical: the whole sheet is turned a quarter
         guard let pixels = FilmStripArt.render(width: fw, height: fh, { ctx in
             ctx.setFillColor(FilmStripArt.paper)
             ctx.fill(CGRect(x: 0, y: 0, width: Double(fw), height: Double(fh)))
+            if vertical { ctx.concatenate(CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: Double(sw))) }
             for r in 0..<rows {
                 let first = r * cols
                 let row = frames[first..<min(first + cols, frames.count)]
                 let items = row.enumerated().compactMap { (k, f) -> FilmStripArt.Frame? in
                     guard let image = f.buffer.cgImage() else { return nil }
-                    return .init(image: image, name: f.name, params: f.params, number: first + k + 1, rotate: f.buffer.height > f.buffer.width)
+                    // Landscape window. A portrait photo is turned a quarter to fit whole, unless it is set to stay upright
+                    // (vertical), in which case it is centre-cropped into the window.
+                    return .init(image: image, name: f.name, params: f.params, number: first + k + 1,
+                                 rotate: f.buffer.height > f.buffer.width && !f.vertical, crop: f.crop)
                 }
                 FilmStripArt.drawStrip(ctx, spec: spec, x: margin, y: margin + Double(r) * (spec.stripH + rowGap),
                                     process: .init(category: row.first?.category ?? ""), rowIndex: r, centeredHoles: false, frames: items)
@@ -111,6 +117,7 @@ enum FilmStripArt {
         let params: String          // capture data, printed edge-style ("ISO 400  F/2.8  1/250")
         let number: Int
         let rotate: Bool            // portrait photo turned 90 degrees clockwise into a landscape window
+        var crop = SheetCrop()      // contact sheet: the user's framing (pan / zoom) inside the window
     }
 
     /// Edge-print ink by development process (C-41 orange, B&W white, E-6 warm skin tone, ECN-2 cream).
@@ -247,8 +254,11 @@ enum FilmStripArt {
         let iw = Double(f.image.width), ih = Double(f.image.height)
         // Cover-fit; a rotated photo is turned 90 degrees clockwise first.
         let sw = f.rotate ? ih : iw, sh = f.rotate ? iw : ih
-        let scale = max(spec.slotW / sw, spec.slotH / sh)
-        ctx.translateBy(x: slot.midX, y: slot.midY)
+        let zoom = max(1, f.crop.zoom)
+        let scale = max(spec.slotW / sw, spec.slotH / sh) * zoom
+        let overflowX = max(0, (sw * scale - spec.slotW) / 2), overflowY = max(0, (sh * scale - spec.slotH) / 2)
+        let panX = min(1, max(-1, f.crop.x)), panY = min(1, max(-1, f.crop.y))
+        ctx.translateBy(x: slot.midX + panX * overflowX, y: slot.midY + panY * overflowY)
         if f.rotate { ctx.rotate(by: .pi / 2) }
         ctx.scaleBy(x: 1, y: -1)                                   // CGImage draws upright in a y-up space
         ctx.draw(f.image, in: CGRect(x: -iw * scale / 2, y: -ih * scale / 2, width: iw * scale, height: ih * scale))

@@ -27,6 +27,7 @@ struct RootView: View {
         .photosPicker(isPresented: $m.showPhotoPicker, selection: $pickerItems, matching: .images)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
+            model.importProgress = "正在读取所选照片…"
             Task {
                 var imports: [(url: URL, name: String)] = []
                 var index = model.photos.count
@@ -37,34 +38,76 @@ struct RootView: View {
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
                     if (try? data.write(to: url)) != nil { imports.append((url, "照片\(index)")) }
                 }
-                if imports.isEmpty { model.message = "无法读取所选照片" } else { model.importPhotos(imports) }
+                if imports.isEmpty { model.importProgress = nil; model.message = "无法读取所选照片" } else { model.importPhotos(imports) }
                 pickerItems = []
             }
         }
-        .fileImporter(isPresented: $m.showFileImporter, allowedContentTypes: [.image, .rawImage], allowsMultipleSelection: true) { result in
-            guard case .success(let urls) = result else { return }
-            var imports: [(url: URL, name: String)] = []
-            for url in urls {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                // Security-scoped access ends here, so keep a private copy.
-                let copy = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("\(UUID().uuidString).\(url.pathExtension)")
-                if (try? FileManager.default.copyItem(at: url, to: copy)) != nil {
-                    imports.append((copy, url.deletingPathExtension().lastPathComponent))
+        // Attached to its own background view: several presentation modifiers (photos picker, file importer, sheet)
+        // on one view can silently stop one of them from presenting on newer iPadOS.
+        .background {
+            Color.clear
+                .fileImporter(isPresented: $m.showFileImporter,
+                              allowedContentTypes: [.image, .rawImage, .data],   // .data: RAW formats that don't declare an image type
+                              allowsMultipleSelection: true) { result in
+                    switch result {
+                    case .success(let urls): importFiles(urls)
+                    case .failure(let error): model.message = "无法打开文件：\(error.localizedDescription)"
+                    }
                 }
-            }
-            if imports.isEmpty { model.message = "无法读取所选文件" } else { model.importPhotos(imports) }
         }
         .sheet(item: $m.sheet) { [model] kind in
             SheetContent(kind: kind, model: model)
                 .environment(model)
-                .presentationDetents((kind == .settings || kind == .export) ? [.large] : [.fraction(0.42), .large])
+                .presentationDetents((kind == .settings || kind == .export || kind == .contactSheet || kind == .photos) ? [.large] : [.fraction(0.42), .large])
                 .presentationBackgroundInteraction(.enabled(upThrough: .fraction(0.42)))
                 .presentationDragIndicator(.visible)
                 .glassSheetBackground()
         }
     }
+}
+
+extension RootView {
+    /// Copies the picked files into the app sandbox (off the main thread, coordinated so iCloud files download first),
+    /// then imports them. Failures are reported with the actual reason.
+    fileprivate func importFiles(_ urls: [URL]) {
+        let model = self.model
+        model.importProgress = "正在读取文件…"
+        Task {
+            var imports: [(url: URL, name: String)] = []
+            var failures: [String] = []
+            for url in urls {
+                do {
+                    let copy = try await Task.detached(priority: .userInitiated) { try copyIntoSandbox(url) }.value
+                    imports.append((copy, url.deletingPathExtension().lastPathComponent))
+                } catch {
+                    failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+                }
+            }
+            if imports.isEmpty {
+                model.importProgress = nil
+                model.message = failures.isEmpty ? "无法读取所选文件" : failures.joined(separator: "\n")
+            } else {
+                if !failures.isEmpty { model.message = failures.joined(separator: "\n") }
+                model.importPhotos(imports)
+            }
+        }
+    }
+}
+
+private func copyIntoSandbox(_ url: URL) throws -> URL {
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    let ext = url.pathExtension
+    let dest = FileManager.default.temporaryDirectory
+        .appendingPathComponent(ext.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(ext)")
+    var coordinationError: NSError?
+    var copyError: Error?
+    NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: url, options: .withoutChanges, error: &coordinationError) { readURL in
+        do { try FileManager.default.copyItem(at: readURL, to: dest) } catch { copyError = error }
+    }
+    if let copyError { throw copyError }
+    if let coordinationError { throw coordinationError }
+    return dest
 }
 
 struct SheetContent: View {
@@ -76,7 +119,11 @@ struct SheetContent: View {
         case .settings:
             SettingsView()
         case .export:
-            ExportView(model: model)
+            ExportView(model: model, mode: .single)
+        case .contactSheet:
+            ExportView(model: model, mode: .sheet)
+        case .photos:
+            PhotoGridView()
         case .library:
             FilmLibraryView(columns: 3).padding([.horizontal, .top]).padding(.top, 8)
         default:
@@ -111,6 +158,9 @@ struct EmptyStateView: View {
                     GlassTextButton(title: "从文件选取（含 RAW）", systemName: "folder") { model.showFileImporter = true }
                 }
             }
+            if let progress = model.importProgress {
+                HStack(spacing: 8) { ProgressView(); Text(progress).font(.footnote).foregroundStyle(.secondary) }
+            }
             if let message = model.message { Text(message).font(.footnote).foregroundStyle(.orange) }
         }
     }
@@ -120,7 +170,13 @@ struct EmptyStateView: View {
 struct MessageToast: View {
     @Environment(EditorModel.self) private var model
     var body: some View {
-        if let message = model.message {
+        if let progress = model.importProgress {
+            HStack(spacing: 8) { ProgressView().controlSize(.small); Text(progress) }
+                .font(.footnote.weight(.medium))
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .glass()
+                .transition(.opacity)
+        } else if let message = model.message {
             Text(message)
                 .font(.footnote.weight(.medium))
                 .padding(.horizontal, 14).padding(.vertical, 9)
@@ -141,6 +197,21 @@ struct OpenMenu: View {
             Image(systemName: "plus").font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44).contentShape(Circle())
         }
         .glass(in: Circle(), interactive: true)
+    }
+}
+
+/// Labelled so it is obvious what it opens: the contact-sheet (索引图) maker.
+struct ContactSheetButton: View {
+    @Environment(EditorModel.self) private var model
+    var body: some View {
+        Button { model.sheet = .contactSheet } label: {
+            Label("索引图", systemImage: "rectangle.split.3x1")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14).frame(height: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .glass(in: Capsule(), interactive: true)
     }
 }
 

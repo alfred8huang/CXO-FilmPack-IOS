@@ -3,8 +3,21 @@ import UIKit
 import CxoShared
 
 enum SheetKind: String, Identifiable {
-    case library, adjust, grain, edge, export, settings
+    case library, adjust, grain, edge, export, contactSheet, settings, photos
     var id: String { rawValue }
+}
+
+/// What a batch apply/paste overwrote, so it can be undone.
+struct BatchUndo {
+    var text: String
+    var items: [(id: UUID, look: Look, filmID: String)]
+}
+
+enum ExportScope: Hashable { case current, selected, all }
+
+struct ExportStatus: Equatable {
+    var text: String
+    var ok: Bool
 }
 
 /// One open photograph with its own film and look.
@@ -17,6 +30,8 @@ struct Photo: Identifiable {
     var look = Look()
     var filmID: String
     var stripImage: UIImage?         // small render with this photo's look
+    var sheetVertical = false        // contact sheet: stay upright (centre-cropped) instead of turning into the window
+    var sheetCrop = SheetCrop()      // contact sheet: the user's framing
 }
 
 @MainActor @Observable
@@ -39,9 +54,12 @@ final class EditorModel {
     }
 
     var isRendering = false
-    var message: String?
+    var message: String? = nil { didSet { scheduleMessageDismiss() } }
+    var importProgress: String?
     var showOriginal = false
-    var sheet: SheetKind?
+    var sheet: SheetKind? {
+        didSet { if sheet != .photos && sheet != .export && sheet != .contactSheet { clearSelection() } }   // selection only lives with the grid / export sheets
+    }
     var showPhotoPicker = false
     var showFileImporter = false
 
@@ -62,8 +80,15 @@ final class EditorModel {
     var isExporting = false
     var exportProgress = ""
     var exportedURLs: [URL] = []
+    var exportStatus: ExportStatus?
     var clipboard: (look: Look, filmID: String)?
 
+    // Multi-select (batch apply settings / batch export)
+    var selection: Set<UUID> = []
+    var lastBatch: BatchUndo?
+    var photosPanelRequest = 0       // iPad: asks the side panel to switch to the photo grid
+
+    @ObservationIgnored private var messageTask: Task<Void, Never>?
     @ObservationIgnored private var isSwitching = false
     @ObservationIgnored private var previewBuffer: PixelBuffer?
     @ObservationIgnored private var renderTask: Task<Void, Never>?
@@ -77,6 +102,19 @@ final class EditorModel {
             selectedFilm = rt.films.first
         } catch {
             startupError = error.localizedDescription
+        }
+    }
+
+    /// Toasts clear themselves: confirmations quickly, errors a bit later.
+    private func scheduleMessageDismiss() {
+        messageTask?.cancel()
+        guard let text = message else { return }
+        let isError = text.contains("：") || text.contains("失败") || text.contains("无法")
+        let nanos: UInt64 = isError ? 6_000_000_000 : 2_500_000_000
+        messageTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled, let self, self.message == text else { return }
+            self.message = nil
         }
     }
 
@@ -99,12 +137,14 @@ final class EditorModel {
         guard let runtime, let defaultFilm = runtime.films.first?.id else { return }
         let originalRaw = cameraRawPipeline == "original"
         Task {
+            defer { importProgress = nil }
             var added: [Photo] = []
-            for item in items {
+            for (n, item) in items.enumerated() {
+                importProgress = "正在导入 \(n + 1) / \(items.count)…"
                 do {
                     let source = try await Task.detached(priority: .userInitiated) { try SourceImage(url: item.url) }.value
                     let decoded = await queue.run(priority: .strip, runtime: runtime, film: nil, look: Look(),
-                                                  input: { try source.makeBuffer(maxEdge: 180, runtime: runtime, originalRaw: originalRaw) },
+                                                  input: { try source.makeBuffer(maxEdge: 360, runtime: runtime, originalRaw: originalRaw) },
                                                   finish: { $0 })
                     let thumb: PixelBuffer
                     switch decoded {
@@ -173,6 +213,7 @@ final class EditorModel {
         guard let i = photos.firstIndex(where: { $0.id == id }) else { return }
         let wasCurrent = id == currentID
         photos.remove(at: i)
+        selection.remove(id)
         queue.cancel(keyPrefix: "strip-\(id)")
         thumbs = thumbs.filter { !$0.key.hasPrefix("\(id)-") }
         guard wasCurrent else { return }
@@ -195,6 +236,72 @@ final class EditorModel {
     func pasteSettings(to id: UUID) {
         guard let c = clipboard else { return }
         apply(look: c.look, filmID: c.filmID, to: id)
+    }
+
+    /// Opens the all-photos grid for multi-select (iPad: in the side panel, otherwise a sheet), current photo picked.
+    func openPhotoGrid(inPanel: Bool) {
+        selection = currentID.map { [$0] } ?? []
+        lastBatch = nil
+        if inPanel { photosPanelRequest += 1 } else { sheet = .photos }
+    }
+
+    func clearSelection() {
+        if !selection.isEmpty { selection = [] }
+        lastBatch = nil
+    }
+
+    private func snapshot(_ ids: [UUID]) -> [(id: UUID, look: Look, filmID: String)] {
+        var out: [(id: UUID, look: Look, filmID: String)] = []
+        for id in ids {
+            if let p = photos.first(where: { $0.id == id }) { out.append((id: id, look: p.look, filmID: p.filmID)) }
+        }
+        return out
+    }
+
+    func undoLastBatch() {
+        guard let batch = lastBatch else { return }
+        for item in batch.items { apply(look: item.look, filmID: item.filmID, to: item.id) }
+        lastBatch = nil
+        message = "已撤销"
+    }
+
+    func toggleSelection(_ id: UUID) {
+        if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+    }
+
+    func selectAllPhotos() { selection = Set(photos.map(\.id)) }
+
+    /// The current photo's film and look, applied to every selected photo.
+    func applyCurrent(toSelected ids: Set<UUID>) {
+        guard let currentID, let p = photos.first(where: { $0.id == currentID }) else { return }
+        let targets = ids.filter { $0 != currentID }
+        guard !targets.isEmpty else { message = "请先选中要应用的其他照片"; return }
+        let before = snapshot(Array(targets))
+        for id in targets { apply(look: p.look, filmID: p.filmID, to: id) }
+        lastBatch = BatchUndo(text: "已应用到 \(targets.count) 张照片", items: before)
+    }
+
+    func pasteToSelected(_ ids: Set<UUID>) {
+        guard let c = clipboard else { return }
+        guard !ids.isEmpty else { message = "请先选中照片"; return }
+        let before = snapshot(Array(ids))
+        for id in ids { apply(look: c.look, filmID: c.filmID, to: id) }
+        lastBatch = BatchUndo(text: "已粘贴设置到 \(ids.count) 张照片", items: before)
+    }
+
+    /// Turning vs staying upright changes the window's axes, so the framing starts over.
+    func setSheetVertical(_ id: UUID, _ vertical: Bool) {
+        guard let i = photos.firstIndex(where: { $0.id == id }), photos[i].sheetVertical != vertical else { return }
+        photos[i].sheetVertical = vertical
+        photos[i].sheetCrop = SheetCrop()
+    }
+
+    func setAllSheetVertical(_ vertical: Bool) {
+        for photo in photos { setSheetVertical(photo.id, vertical) }
+    }
+
+    func setSheetCrop(_ id: UUID, _ crop: SheetCrop) {
+        if let i = photos.firstIndex(where: { $0.id == id }), photos[i].sheetCrop != crop { photos[i].sheetCrop = crop }
     }
 
     func syncAll(from id: UUID) {
@@ -222,7 +329,7 @@ final class EditorModel {
         Task { [weak self] in
             guard let self else { return }
             let r = await self.queue.run(priority: .strip, key: "strip-\(id)", runtime: runtime, film: film, look: look,
-                                         input: { try source.makeBuffer(maxEdge: 180, runtime: runtime, originalRaw: pipeline == "original") }, finish: { $0.uiImage() })
+                                         input: { try source.makeBuffer(maxEdge: 360, runtime: runtime, originalRaw: pipeline == "original") }, finish: { $0.uiImage() })
             if case .success(let image?) = r, let j = self.photos.firstIndex(where: { $0.id == id }),
                self.photos[j].look == look, self.photos[j].filmID == film.id, self.cameraRawPipeline == pipeline {
                 self.photos[j].stripImage = image
@@ -270,7 +377,7 @@ final class EditorModel {
             let r = await self.queue.run(priority: .preview, key: "preview", runtime: runtime, film: film, look: look,
                                          input: { buffer },
                                          finish: { (full: PixelBuffer) -> (UIImage?, UIImage?) in
-                                             (full.uiImage(), full.downscaled(maxEdge: 200)?.uiImage())
+                                             (full.uiImage(), full.downscaled(maxEdge: 360)?.uiImage())
                                          })
             guard !Task.isCancelled, self.currentID == photoID else { return }
             switch r {
@@ -290,15 +397,23 @@ final class EditorModel {
 
     // MARK: Export
 
-    func export(all: Bool) async {
+    func export(scope: ExportScope) async {
         guard let runtime, !isExporting else { return }
-        let targets: [Photo] = all ? photos : (currentIndex.map { [photos[$0]] } ?? [])
+        let targets: [Photo]
+        switch scope {
+        case .current: targets = currentIndex.map { [photos[$0]] } ?? []
+        case .selected: targets = photos.filter { selection.contains($0.id) }
+        case .all: targets = photos
+        }
         guard !targets.isEmpty else { return }
         isExporting = true
         defer { isExporting = false }
         message = nil
+        exportStatus = nil
         exportedURLs = []
         exportProgress = ""
+        var failures = 0
+        var lastError = ""
         let options = exportOptions
         let originalRaw = cameraRawPipeline == "original"
         var urls: [URL] = []
@@ -327,13 +442,26 @@ final class EditorModel {
             case .success(let url?): urls.append(url)
             case .success(nil): break
             case .failure(let error):
-                message = error.localizedDescription
+                failures += 1
+                lastError = error.localizedDescription
+                message = lastError
             }
         }
         exportedURLs = urls
+        if urls.isEmpty {
+            exportStatus = ExportStatus(text: "导出失败：\(lastError.isEmpty ? "没有可导出的照片" : lastError)", ok: false)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        } else {
+            let tail = failures > 0 ? "，\(failures) 张失败" : ""
+            exportStatus = ExportStatus(text: "导出成功：已渲染 \(urls.count) 张\(tail)，可分享、存到文件或存入相册", ok: failures == 0)
+            UINotificationFeedbackGenerator().notificationOccurred(failures == 0 ? .success : .warning)
+        }
     }
 
     /// Small live preview of what an export would look like; composed off the main actor, never on the render queue.
+    /// Photos that go on the contact sheet: the picked ones, or everything when nothing is picked.
+    var sheetPhotos: [Photo] { selection.isEmpty ? photos : photos.filter { selection.contains($0.id) } }
+
     func exportPreview(mode: ExportMode, options: ExportOptions) async -> UIImage? {
         guard let runtime else { return nil }
         switch mode {
@@ -349,18 +477,18 @@ final class EditorModel {
                 return Encoder.watermarked(buffer, style: style, info: info, orientation: orientation).uiImage()
             }.value
         case .sheet:
-            var frames: [(buffer: PixelBuffer, name: String, category: String, params: String)] = []
-            for photo in photos {
+            var frames: [(buffer: PixelBuffer, name: String, category: String, params: String, vertical: Bool, crop: SheetCrop)] = []
+            for photo in sheetPhotos {
                 guard let film = runtime.films.first(where: { $0.id == photo.filmID }) else { continue }
                 let buffer = photo.stripImage?.cgImage.flatMap { PixelBuffer.from(cgImage: $0) } ?? photo.thumb
                 let params = WatermarkInfo(properties: photo.source.properties, film: film.name, category: film.category,
                                            strength: photo.look.strength, number: 1).edgeParams
-                frames.append((buffer, film.name, film.category, params))
+                frames.append((buffer, film.name, film.category, params, photo.sheetVertical, photo.sheetCrop))
             }
-            let is135 = options.sheetFormat == .f135, cols = options.sheetColumns
+            let is135 = options.sheetFormat == .f135, cols = options.sheetColumns, vertical = options.sheetVertical
             let done = frames
             return await Task.detached(priority: .utility) { () -> UIImage? in
-                Encoder.contactSheet(done, is135: is135, columns: cols, cellEdge: 260)?.uiImage()
+                Encoder.contactSheet(done, is135: is135, columns: cols, cellEdge: 260, vertical: vertical)?.uiImage()
             }.value
         }
     }
@@ -368,17 +496,18 @@ final class EditorModel {
     /// Renders every open photo with its own film and look, then lays them out as one contact sheet.
     func exportSheet() async {
         guard let runtime, !photos.isEmpty, !isExporting else { return }
-        let targets = photos
+        let targets = sheetPhotos
         isExporting = true
         defer { isExporting = false }
         message = nil
+        exportStatus = nil
         exportedURLs = []
         exportProgress = ""
         let options = exportOptions
         let originalRaw = cameraRawPipeline == "original"
         let cols = max(1, min(options.sheetColumns, targets.count))
         let edge = Int(min(1000.0, 6000.0 / Double(cols)))
-        var frames: [(buffer: PixelBuffer, name: String, category: String, params: String)] = []
+        var frames: [(buffer: PixelBuffer, name: String, category: String, params: String, vertical: Bool, crop: SheetCrop)] = []
         for (n, photo) in targets.enumerated() {
             guard !Task.isCancelled else { return }
             guard let film = runtime.films.first(where: { $0.id == photo.filmID }) else { continue }
@@ -392,7 +521,7 @@ final class EditorModel {
             case .success(let buffer?):
                 let params = WatermarkInfo(properties: source.properties, film: film.name, category: film.category,
                                            strength: photo.look.strength, number: n + 1).edgeParams
-                frames.append((buffer, film.name, film.category, params))
+                frames.append((buffer, film.name, film.category, params, photo.sheetVertical, photo.sheetCrop))
             case .success(nil): break
             case .failure(let error): message = error.localizedDescription
             }
@@ -403,7 +532,7 @@ final class EditorModel {
         do {
             let url = try await Task.detached(priority: .userInitiated) { () -> URL in
                 guard let sheet = Encoder.contactSheet(completedFrames, is135: options.sheetFormat == .f135,
-                                                       columns: cols, cellEdge: Double(edge)) else {
+                                                       columns: cols, cellEdge: Double(edge), vertical: options.sheetVertical) else {
                     throw AppError.message("无法生成索引图")
                 }
                 let data = try Encoder.encode(sheet, format: options.format, quality: options.quality, properties: [:])
@@ -414,16 +543,24 @@ final class EditorModel {
             }.value
             guard !Task.isCancelled else { return }
             exportedURLs = [url]
-        } catch { message = error.localizedDescription }
+            exportStatus = ExportStatus(text: "导出成功：索引图已生成（\(completedFrames.count) 张），可分享、存到文件或存入相册", ok: true)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        } catch {
+            message = error.localizedDescription
+            exportStatus = ExportStatus(text: "导出失败：\(error.localizedDescription)", ok: false)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
     }
 
     func saveToPhotos() async {
         guard !exportedURLs.isEmpty else { return }
         do {
             try await Encoder.saveToPhotos(exportedURLs)
-            message = "已存入相册"
+            exportStatus = ExportStatus(text: "已存入相册（\(exportedURLs.count) 张）", ok: true)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
         } catch {
-            message = error.localizedDescription
+            exportStatus = ExportStatus(text: "存入相册失败：\(error.localizedDescription)", ok: false)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
         }
     }
 

@@ -37,7 +37,6 @@ struct PhoneLayout: View {
         VStack(spacing: 10) {
             VStack(spacing: 8) {
                 if model.photos.count > 1 { PhotoStrip(height: 56) }
-                FilmStrip(cardWidth: 88)
                 HStack(spacing: 10) {
                     Text("强度").font(.footnote.weight(.medium))
                     Slider(value: model.intBinding(\.strength), in: 0...200, step: 1)

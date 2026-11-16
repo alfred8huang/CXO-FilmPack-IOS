@@ -4,7 +4,7 @@ import SwiftUI
 /// a quick film strip along the bottom, and a slim top bar.
 struct PadLayout: View {
     enum Tab: String, CaseIterable, Identifiable {
-        case films = "胶片", customize = "调整"
+        case films = "胶片", customize = "调整", photos = "照片"
         var id: String { rawValue }
     }
 
@@ -37,6 +37,13 @@ struct PadLayout: View {
             }
             .padding(.trailing, 16)
             .padding(.top, 76).padding(.bottom, showStrip ? 150 : 24)
+        }
+        .onChange(of: model.photosPanelRequest) { _, _ in
+            tab = .photos
+            showPanel = true
+        }
+        .onChange(of: tab) { _, newTab in
+            if newTab != .photos && model.sheet != .export { model.clearSelection() }
         }
         .animation(.smooth(duration: 0.25), value: showPanel)
         .animation(.smooth(duration: 0.25), value: showStrip)
@@ -80,6 +87,11 @@ struct PadLayout: View {
                     CustomizeView().padding(.bottom, 12)
                 }
                 .scrollIndicators(.hidden)
+            case .photos:
+                PhotoGridPanel(minTile: 88) {
+                    tab = .films
+                    model.clearSelection()
+                }
             }
         }
         .padding(14)

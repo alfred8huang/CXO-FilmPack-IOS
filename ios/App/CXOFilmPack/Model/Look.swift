@@ -71,6 +71,14 @@ enum WatermarkStyle: String, CaseIterable, Identifiable {
 
 enum ExportMode: Hashable { case single, sheet }
 
+/// Contact-sheet framing of one photo: pan within the window (-1...1 of the available overflow, window axes) and zoom.
+struct SheetCrop: Hashable {
+    var x = 0.0
+    var y = 0.0
+    var zoom = 1.0
+    var isDefault: Bool { x == 0 && y == 0 && zoom == 1 }
+}
+
 /// Which way the film strip runs around a single photo. A portrait photo in a horizontal strip is turned 90°
 /// into the frame (as on a contact sheet) so the edge print reads upright.
 enum StripOrientation: String, CaseIterable, Identifiable {
@@ -86,6 +94,7 @@ enum SheetFormat: String, CaseIterable, Identifiable {
 struct ExportOptions: Equatable {
     var sheetFormat: SheetFormat = .f135
     var sheetColumns = 4
+    var sheetVertical = false          // strips run top-to-bottom (portrait sheet)
     var style: WatermarkStyle = .none
     var orientation: StripOrientation = .auto
     var format: OutputFormat = .jpeg

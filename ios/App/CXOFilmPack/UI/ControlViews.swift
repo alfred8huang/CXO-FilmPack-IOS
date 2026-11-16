@@ -96,6 +96,41 @@ struct CustomizeView: View {
             ColorSection()
             GroupHeader("图形效果")
             EdgeView()
+            FrameSection()
+        }
+    }
+}
+
+/// Watermark / film-frame style, chosen like any other tool; the export page just renders it.
+struct FrameSection: View {
+    @Environment(EditorModel.self) private var model
+
+    var body: some View {
+        @Bindable var m = model
+        PanelSection(title: "边框 / 水印") {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
+                ForEach(WatermarkStyle.allCases) { style in
+                    let selected = m.exportOptions.style == style
+                    Button { m.exportOptions.style = style } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: style.symbol).font(.system(size: 18))
+                            Text(style.rawValue).font(.caption)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .foregroundStyle(selected ? Color.accentColor : Color.primary)
+                        .background(selected ? Color.accentColor.opacity(0.15) : Color.white.opacity(0.06),
+                                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if m.exportOptions.style == .film135 {
+                Picker("方向", selection: $m.exportOptions.orientation) {
+                    ForEach(StripOrientation.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            }
         }
     }
 }
@@ -183,37 +218,65 @@ struct ExportView: View {
     // The export sheet owns an explicit reference to the existing editor model.
     let model: EditorModel
     @Environment(\.dismiss) private var dismiss
-    @State private var mode: ExportMode = .single
-    @State private var exportAll = false
+    let mode: ExportMode      // .single: export panel; .sheet: the contact-sheet panel
+    var embedded = false      // true when hosted inside the iPad side panel (no nav bar / 完成)
+    @State private var editing: PhotoRef?
+
+    private struct PhotoRef: Identifiable { let id: UUID }
+    @State private var scope: ExportScope = .current
     @State private var preview: UIImage?
 
+    /// Falls back to the current photo when the chosen scope no longer applies.
+    private var effectiveScope: ExportScope {
+        if model.photos.count < 2 { return .current }
+        if scope == .selected && model.selection.isEmpty { return .current }
+        return scope
+    }
+
     private struct PreviewKey: Hashable {
-        let mode: ExportMode, style: WatermarkStyle, orientation: StripOrientation, format: SheetFormat, columns: Int, photo: UUID?, count: Int
+        let mode: ExportMode, style: WatermarkStyle, orientation: StripOrientation, format: SheetFormat, columns: Int, vertical: Bool, perPhoto: [Bool], crops: [SheetCrop], photo: UUID?, count: Int, picked: Set<UUID>
     }
 
     var body: some View {
         let o = model.exportOptions
-        NavigationStack {
-            GeometryReader { geo in
-                let wide = geo.size.width > 760
-                let layout = wide ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
-                layout {
-                    previewPane
-                        .frame(maxWidth: .infinity, maxHeight: wide ? .infinity : geo.size.height * 0.4)
-                    ScrollView { options.padding(14) }
-                        .frame(width: wide ? 380 : nil)
+        Group {
+            if embedded {
+                content
+            } else {
+                NavigationStack {
+                    content
+                        .navigationTitle(mode == .sheet ? "胶片索引图" : "导出")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
                 }
             }
-            .navigationTitle("导出")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
         }
-        .task(id: PreviewKey(mode: mode, style: o.style, orientation: o.orientation, format: o.sheetFormat, columns: o.sheetColumns,
-                             photo: model.currentID, count: model.photos.count)) {
+        .onAppear { if model.photos.count > 1, !model.selection.isEmpty { scope = .selected } }
+        .sheet(item: $editing) { ref in
+            SheetCropEditor(photoID: ref.id, windowAspect: model.exportOptions.sheetFormat == .f135 ? 1.5 : 1.0)
+                .environment(model)
+                .presentationDetents([.large])
+                .interactiveDismissDisabled()      // dragging the photo must not pull the sheet down; use 完成
+        }
+        .task(id: PreviewKey(mode: mode, style: o.style, orientation: o.orientation, format: o.sheetFormat, columns: o.sheetColumns, vertical: o.sheetVertical,
+                             perPhoto: model.photos.map(\.sheetVertical), crops: model.photos.map(\.sheetCrop), photo: model.currentID, count: model.photos.count, picked: model.selection)) {
             try? await Task.sleep(nanoseconds: 80_000_000)
             if Task.isCancelled { return }
             let image = await model.exportPreview(mode: mode, options: model.exportOptions)
             if !Task.isCancelled { preview = image }
+        }
+    }
+
+    private var content: some View {
+        GeometryReader { geo in
+            let wide = geo.size.width > 760
+            let layout = wide ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
+            layout {
+                previewPane
+                    .frame(maxWidth: .infinity, maxHeight: wide ? .infinity : geo.size.height * (embedded ? 0.34 : 0.4))
+                ScrollView { options.padding(embedded ? 4 : 14) }
+                    .frame(width: wide ? 380 : nil)
+            }
         }
     }
 
@@ -233,42 +296,12 @@ struct ExportView: View {
     private var options: some View {
         @Bindable var m = model
         return VStack(spacing: 12) {
-            Picker("类型", selection: $mode) {
-                Text("单张").tag(ExportMode.single)
-                Text("索引图").tag(ExportMode.sheet)
-            }
-            .pickerStyle(.segmented)
-
             if mode == .single {
-                PanelSection(title: "水印") {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
-                        ForEach(WatermarkStyle.allCases) { style in
-                            let selected = m.exportOptions.style == style
-                            Button { m.exportOptions.style = style } label: {
-                                VStack(spacing: 4) {
-                                    Image(systemName: style.symbol).font(.system(size: 18))
-                                    Text(style.rawValue).font(.caption)
-                                }
-                                .frame(maxWidth: .infinity, minHeight: 56)
-                                .foregroundStyle(selected ? Color.accentColor : Color.primary)
-                                .background(selected ? Color.accentColor.opacity(0.15) : Color.white.opacity(0.06),
-                                            in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                if m.exportOptions.style == .film135 {
-                    Picker("方向", selection: $m.exportOptions.orientation) {
-                        ForEach(StripOrientation.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                }
                 if m.photos.count > 1 {
-                    Picker("范围", selection: $exportAll) {
-                        Text("当前照片").tag(false)
-                        Text("全部 \(m.photos.count) 张").tag(true)
+                    Picker("范围", selection: $scope) {
+                        Text("当前照片").tag(ExportScope.current)
+                        if !m.selection.isEmpty { Text("所选 \(m.selection.count) 张").tag(ExportScope.selected) }
+                        Text("全部 \(m.photos.count) 张").tag(ExportScope.all)
                     }
                     .pickerStyle(.segmented)
                 }
@@ -278,8 +311,28 @@ struct ExportView: View {
                         ForEach(SheetFormat.allCases) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented)
-                    Stepper("每行 \(m.exportOptions.sheetColumns) 张", value: $m.exportOptions.sheetColumns, in: 2...8)
-                    Text("全部 \(m.photos.count) 张，各自套用当前的胶片和调整。").font(.footnote).foregroundStyle(.secondary)
+                    Picker("方向", selection: $m.exportOptions.sheetVertical) {
+                        Text("横排").tag(false)
+                        Text("竖排").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    Stepper(m.exportOptions.sheetVertical ? "每列 \(m.exportOptions.sheetColumns) 张" : "每行 \(m.exportOptions.sheetColumns) 张",
+                            value: $m.exportOptions.sheetColumns, in: 2...8)
+                    if m.exportOptions.sheetFormat == .f135 {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 14) {
+                                Text("每张照片的方向").font(.footnote.weight(.medium))
+                                Spacer(minLength: 0)
+                                Button("全部横向") { m.setAllSheetVertical(false) }.font(.footnote)
+                                Button("全部竖向") { m.setAllSheetVertical(true) }.font(.footnote)
+                            }
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 8)], spacing: 8) {
+                                ForEach(m.sheetPhotos) { photo in SheetOrientationTile(photo: photo) { editing = PhotoRef(id: photo.id) } }
+                            }
+                            Text("点一下照片调整：横向 / 竖向，再用手指拖动、捏合来调整构图。").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("\(m.selection.isEmpty ? "全部" : "所选") \(m.sheetPhotos.count) 张，各自套用自己的胶片和调整。").font(.footnote).foregroundStyle(.secondary)
                 }
             }
 
@@ -312,10 +365,16 @@ struct ExportView: View {
                     GlassTextButton(title: m.exportedURLs.isEmpty ? "渲染并导出" : "重新渲染", systemName: "wand.and.stars", prominent: true) {
                         Task {
                             if mode == .sheet { await m.exportSheet() }
-                            else { await m.export(all: exportAll && m.photos.count > 1) }
+                            else { await m.export(scope: effectiveScope) }
                         }
                     }
                     .disabled(m.photos.isEmpty)
+                }
+                if let status = m.exportStatus, !m.isExporting {
+                    Label(status.text, systemImage: status.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(status.ok ? Color.green : Color.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if !m.exportedURLs.isEmpty, !m.isExporting {
                     HStack(spacing: 10) {
@@ -327,6 +386,150 @@ struct ExportView: View {
                 }
             }
         }
+    }
+}
+
+/// One photo in the contact-sheet panel; tap to open its framing editor.
+struct SheetOrientationTile: View {
+    let photo: Photo
+    let onEdit: () -> Void
+
+    var body: some View {
+        Button(action: onEdit) {
+            Color.white.opacity(0.06)
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    if let image = photo.stripImage ?? photo.originalThumb {
+                        Image(uiImage: image).resizable().scaledToFill()
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(alignment: .bottomTrailing) {
+                    HStack(spacing: 3) {
+                        Image(systemName: photo.sheetVertical ? "rectangle.portrait" : "rectangle")
+                        Text(photo.sheetVertical ? "竖" : "横")
+                        if !photo.sheetCrop.isDefault { Image(systemName: "crop") }
+                    }
+                    .font(.caption2.weight(.bold)).foregroundStyle(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(Color.black.opacity(0.6), in: Capsule())
+                    .padding(5)
+                }
+                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Frame one photo inside its contact-sheet window by touch: drag to move, pinch (or the slider) to zoom.
+/// Uses the same maths as the renderer, so what is framed here is what the sheet shows.
+struct SheetCropEditor: View {
+    @Environment(EditorModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let photoID: UUID
+    let windowAspect: Double          // window width / height
+
+    @State private var dragStart: SheetCrop?
+    @State private var zoomStart: Double?
+
+    private var photo: Photo? { model.photos.first { $0.id == photoID } }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let photo, let image = photo.stripImage ?? photo.originalThumb {
+                    editor(photo, image)
+                } else {
+                    Text("照片已移除").foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("调整构图")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
+        }
+    }
+
+    private func editor(_ photo: Photo, _ image: UIImage) -> some View {
+        let portrait = image.size.height > image.size.width
+        let rotate = portrait && !photo.sheetVertical
+        let crop = photo.sheetCrop
+        return VStack(spacing: 18) {
+            GeometryReader { geo in
+                let winH = min(360.0, (geo.size.width - 32) / windowAspect)
+                let winW = winH * windowAspect
+                let aw = rotate ? image.size.height : image.size.width
+                let ah = rotate ? image.size.width : image.size.height
+                let k = max(winW / aw, winH / ah) * max(1, crop.zoom)
+                let dispW = aw * k, dispH = ah * k
+                let overflowX = max(0, (dispW - winW) / 2), overflowY = max(0, (dispH - winH) / 2)
+                ZStack {
+                    Color.black
+                    Image(uiImage: image).resizable()
+                        .frame(width: rotate ? dispH : dispW, height: rotate ? dispW : dispH)
+                        .rotationEffect(rotate ? .degrees(90) : .zero)
+                        .offset(x: crop.x * overflowX, y: crop.y * overflowY)
+                }
+                .frame(width: winW, height: winH)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .contentShape(Rectangle())
+                .gesture(dragGesture(overflowX: overflowX, overflowY: overflowY))
+                .simultaneousGesture(pinchGesture())
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(height: 380)
+
+            VStack(spacing: 14) {
+                if portrait {
+                    Picker("方向", selection: Binding(get: { photo.sheetVertical }, set: { model.setSheetVertical(photoID, $0) })) {
+                        Text("横向（转 90°，完整）").tag(false)
+                        Text("竖向（摆正，裁切）").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                HStack(spacing: 10) {
+                    Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
+                    Slider(value: Binding(get: { crop.zoom }, set: { setZoom($0) }), in: 1...4)
+                    Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
+                }
+                Button("还原构图") { model.setSheetCrop(photoID, SheetCrop()) }
+                    .disabled(crop.isDefault)
+                Text("拖动照片移动位置，双指捏合或用滑块缩放。").font(.footnote).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 20)
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 12)
+    }
+
+    private func dragGesture(overflowX: Double, overflowY: Double) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                guard let current = photo?.sheetCrop else { return }
+                let start = dragStart ?? current
+                dragStart = start
+                var c = current
+                if overflowX > 0.5 { c.x = min(1, max(-1, start.x + value.translation.width / overflowX)) }
+                if overflowY > 0.5 { c.y = min(1, max(-1, start.y + value.translation.height / overflowY)) }
+                model.setSheetCrop(photoID, c)
+            }
+            .onEnded { _ in dragStart = nil }
+    }
+
+    private func pinchGesture() -> some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                guard let current = photo?.sheetCrop else { return }
+                let start = zoomStart ?? current.zoom
+                zoomStart = start
+                setZoom(start * value.magnification)
+            }
+            .onEnded { _ in zoomStart = nil }
+    }
+
+    private func setZoom(_ zoom: Double) {
+        guard var c = photo?.sheetCrop else { return }
+        c.zoom = min(4, max(1, zoom))
+        model.setSheetCrop(photoID, c)
     }
 }
 
